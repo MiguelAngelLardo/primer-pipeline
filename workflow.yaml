@@ -1,0 +1,1067 @@
+name: Terragrunt Workflow
+
+on: 
+  workflow_dispatch:
+    inputs:
+      destroy_directory:
+        description: 'Directory to destroy'
+        default: "aws/<environment>/<region>/resources/<resource>"
+        required: true
+  pull_request:
+    paths:
+      - 'aws/**.hcl'
+      - '!aws/_envcommon/**'
+
+env:
+  AWS_REGION: us-east-1
+  DEBUG: false
+  tf_version: 1.5.7 #Check 
+  tg_version: 0.72.5
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-skip-condition:
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    outputs:
+      should_skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Check commit message for wkno
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            commit_message="${{ github.event.pull_request.title }}"
+            # Also check the last commit message in the PR
+            last_commit_message=$(git log --format=%B -n 1 ${{ github.event.pull_request.head.sha }})
+            if [[ "$commit_message" == *"wkno"* ]] || [[ "$last_commit_message" == *"wkno"* ]]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "🚫 Found 'wkno' in PR title or commit message. Skipping workflow."
+              exit 0
+            else
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "✅ No 'wkno' found in PR title or commit message. Proceeding with workflow."
+            fi
+          else
+            commit_message="${{ github.event.head_commit.message }}"
+            if [[ "$commit_message" == *"wkno"* ]]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "🚫 Found 'wkno' in commit message. Skipping workflow."
+              exit 0
+            else
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "✅ No 'wkno' found in commit message. Proceeding with workflow."
+            fi
+          fi
+
+  get-modified-files:
+    needs: [check-skip-condition]
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    environment:
+      name: terragruntPlan
+    # Only for PRs and if workflow should not be skipped
+    if: github.event_name == 'pull_request' && needs.check-skip-condition.outputs.should_skip != 'true'
+    outputs:
+      matrix: ${{ steps.get-terragrunt-dirs.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed terragrunt files
+        id: changed-terragrunt-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            aws/**/terragrunt.hcl
+          files_ignore: |
+            aws/_envcommon/**
+
+      - name: Get directories with terragrunt changes
+        id: get-terragrunt-dirs
+        if: steps.changed-terragrunt-files.outputs.all_changed_files != ''
+        run: |
+          # Process directories and create JSON directly
+          matrix_json=$(echo "${{ steps.changed-terragrunt-files.outputs.all_changed_files }}" | \
+            tr ' ' '\n' | \
+            xargs -I {} dirname {} | \
+            sort -u | \
+            jq -R -n '[inputs]')
+
+          # Debug: Print the generated JSON (for inspection)
+          echo "Debug: Generated JSON:"
+          echo "$matrix_json" | jq .
+
+          # Ensure valid JSON
+          echo "$matrix_json" | jq empty > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "Error: Generated JSON is invalid."
+            exit 1
+          fi
+
+          # Convert JSON array into a valid GitHub Actions output string
+          escaped_matrix_json=$(echo "$matrix_json" | jq -c .)
+
+          # Set the output (as a single string, no newlines or extra commas)
+          echo "matrix=$escaped_matrix_json" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ env.DEBUG }}" = "true" ]; then
+            echo "Debug: JSON output:"
+            echo "$escaped_matrix_json" | jq .
+          fi
+
+      - name: Get changed directories for AWS accounts
+        id: changed-files-yaml
+        uses: tj-actions/changed-files@v45
+        with:
+          dir_names_max_depth: "5"
+          files_yaml: |
+            aft:
+              - aws/AFT/**
+            audit:
+              - aws/Audit/**
+            dev:
+              - aws/Dev/**
+            networking:
+              - aws/Networking/**
+            prod:
+              - aws/Prod/**
+            qa:
+              - aws/QA/**
+            shared_services:
+              - aws/SharedServices/**
+            merlin_organization:
+              - aws/Merlin_Organization/**
+            marketplace:
+              - aws/Marketplace/**
+
+      - name: Changes at AFT?
+        if: steps.changed-files-yaml.outputs.aft_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_AFT }}" > rol-aft.txt
+
+      - name: Changes at Audit?
+        if: steps.changed-files-yaml.outputs.audit_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_AUDIT }}" > rol-audit.txt
+
+      - name: Changes at Dev?
+        if: steps.changed-files-yaml.outputs.dev_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_DEV }}" > rol-dev.txt
+
+      - name: Changes at Networking?
+        if: steps.changed-files-yaml.outputs.networking_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_NETWORKING }}" > rol-networking.txt
+
+      - name: Changes at Prod?
+        if: steps.changed-files-yaml.outputs.prod_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_PROD }}" > rol-prod.txt
+
+      - name: Changes at QA?
+        if: steps.changed-files-yaml.outputs.qa_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_QA }}" > rol-qa.txt
+
+      - name: Changes at Shared Services?
+        if: steps.changed-files-yaml.outputs.shared_services_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_SHARED_SERVICES }}" > rol-sharedservices.txt
+
+      - name: Changes at merlin_organization?
+        if: steps.changed-files-yaml.outputs.merlin_organization_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_MERLIN_ORGANIZATION }}" > rol-merlin_organization.txt
+      
+      - name: Changes at marketplace?
+        if: steps.changed-files-yaml.outputs.marketplace_any_changed == 'true'
+        run: |
+          echo "${{ secrets.ASSUME_ROL_MARKETPLACE }}" > rol-marketplace.txt
+      
+      - name: Upload the role to be used
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: roles
+          path: rol-*
+
+  format-and-validate:
+    needs: [check-skip-condition, get-modified-files]
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    # Only for PRs and if workflow should not be skipped
+    if: github.event_name == 'pull_request' && needs.check-skip-condition.outputs.should_skip != 'true' && needs.get-modified-files.outputs.matrix != ''
+    strategy:
+      matrix:
+        PROJECT_DIRECTORY: ${{ fromJSON(needs.get-modified-files.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.PROJECT_DIRECTORY }}
+    environment:
+      name: terragruntPlan
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get GH Token
+        id: get_gh_token
+        uses: peter-murray/workflow-application-token-action@v4
+        with:
+          application_id: ${{ vars.GH_APP_ID }}
+          application_private_key: ${{ secrets.GH_APP_KEY }}
+          organization: Merlin-Data-Quality
+
+      - name: Configure Git for All Module Types
+        run: |
+          echo "🔧 Configuring Git for public and private modules..."
+          
+          # Configurar .netrc para acceso HTTPS
+          echo "machine github.com login x password ${GH_APP_KEY}" > ~/.netrc
+          chmod 600 ~/.netrc
+          
+          # Configurar git globals
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git config --global advice.detachedHead false
+          
+          # Configurar credential helper para Terragrunt
+          git config --global credential.helper store
+          echo "https://x:${GH_APP_KEY}@github.com" > ~/.git-credentials
+          
+          echo "✅ Git configured for both public and private repositories"
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+
+      - name: Extract substring from matrix.PROJECT_DIRECTORY
+        id: extract_substring
+        run: |
+          # Extract account name from directory path
+          substring=$(echo "${{ matrix.PROJECT_DIRECTORY }}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+          echo "substring=$substring" >> "$GITHUB_OUTPUT"
+
+      - name: Download rol value
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: roles
+
+      - name: Set workspace path
+        id: workspace
+        run: |
+          if [[ "${{ vars.RUNNER_TYPE }}" == "ubuntu-latest" ]]; then
+            echo "path=/home/runner/work/iac/iac" >> $GITHUB_OUTPUT
+          else
+            echo "path=/home/ubuntu/actions-runner/_work/iac/iac" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Obtain the role
+        id: awsrol
+        shell: bash
+        run: |
+          cd ${{ steps.workspace.outputs.path }}
+          export value=$(cat rol-${{ steps.extract_substring.outputs.substring }}.txt)
+          echo "SELECTED_ROL=${value}" >> $GITHUB_OUTPUT
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.awsrol.outputs.SELECTED_ROL }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: samplerolesession
+
+      - name: Configure AWS Credentials for Backend
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "${{ secrets.ASSUME_ROL_BACKEND }}"
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: backendrolesession
+          role-chaining: true
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.tf_version }}
+      
+      - name: Setup Terragrunt
+        run: |
+          sudo wget -q -O /bin/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.tg_version }}/terragrunt_linux_amd64"
+          sudo chmod +x /bin/terragrunt
+          terragrunt -v
+
+      - name: Check Terragrunt code
+        run: |
+          terragrunt hclfmt
+
+      - name: Validate Terragrunt configuration
+        run: |
+          terragrunt validate
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+
+  terragrunt-plan:
+    needs: [check-skip-condition, get-modified-files, format-and-validate]
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    # Only for PRs and if workflow should not be skipped
+    if: github.event_name == 'pull_request' && needs.check-skip-condition.outputs.should_skip != 'true'
+    strategy:
+      matrix:
+        PROJECT_DIRECTORY: ${{ fromJSON(needs.get-modified-files.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.PROJECT_DIRECTORY }}
+    environment:
+      name: terragruntPlan
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Get GH Token
+        id: get_gh_token
+        uses: peter-murray/workflow-application-token-action@v4
+        with:
+          application_id: ${{ vars.GH_APP_ID }}
+          application_private_key: ${{ secrets.GH_APP_KEY }}
+          organization: Merlin-Data-Quality
+
+      - name: Configure Git for All Module Types
+        run: |
+          echo "🔧 Configuring Git for public and private modules..."
+          
+          # Configurar .netrc para acceso HTTPS
+          echo "machine github.com login x password ${GH_APP_KEY}" > ~/.netrc
+          chmod 600 ~/.netrc
+          
+          # Configurar git globals
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git config --global advice.detachedHead false
+          
+          # Configurar credential helper para Terragrunt
+          git config --global credential.helper store
+          echo "https://x:${GH_APP_KEY}@github.com" > ~/.git-credentials
+          
+          echo "✅ Git configured for both public and private repositories"
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+
+      - name: Extract substring from matrix.PROJECT_DIRECTORY
+        id: extract_substring
+        run: |
+          substring=${{ matrix.PROJECT_DIRECTORY }}
+          substring=$(echo $substring | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+          echo "substring=$substring" >> $GITHUB_OUTPUT
+
+      - name: Extract planid from matrix.PROJECT_DIRECTORY
+        id: planid
+        run: |
+          planid=$(echo "${{ matrix.PROJECT_DIRECTORY }}" | sed 's/\///g')
+          planid=$(echo $planid | tr '[:upper:]' '[:lower:]')
+          echo "planid=$planid" >> $GITHUB_OUTPUT
+
+      - name: Download rol value
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: roles
+
+      - name: Set workspace path
+        id: workspace
+        run: |
+          if [[ "${{ vars.RUNNER_TYPE }}" == "ubuntu-latest" ]]; then
+            echo "path=/home/runner/work/iac/iac" >> $GITHUB_OUTPUT
+          else
+            echo "path=/home/ubuntu/actions-runner/_work/iac/iac" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Obtain the role
+        id: awsrol
+        shell: bash
+        run: |
+          cd ${{ steps.workspace.outputs.path }}
+          export value=$(cat rol-${{ steps.extract_substring.outputs.substring }}.txt)
+          echo "SELECTED_ROL=${value}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.awsrol.outputs.SELECTED_ROL }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: samplerolesession
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.tf_version }}
+
+      - name: Setup Terragrunt
+        run: |
+          sudo wget -q -O /bin/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.tg_version }}/terragrunt_linux_amd64"
+          sudo chmod +x /bin/terragrunt
+          terragrunt -v
+
+      - name: Terragrunt plan
+        run: |
+          terragrunt plan | tee -a /tmp/tgplan.txt
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+          TF_VAR_backend_role_arn: "${{ secrets.ASSUME_ROL_BACKEND }}"
+
+      - name: Add comment to PR (Terraform Plan)
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_gh_token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            fs.readFile('/tmp/tgplan.txt', 'utf8', async (err, output) => {
+              if (err) {
+                console.error(err);
+                return;
+              }
+              
+              // Maintain existing output processing
+              refreshSeparator = "------------------------------------------------------------------------\n"
+              idx = output.indexOf(refreshSeparator);
+              if (idx > -1) {
+                  output = output.substring(idx + refreshSeparator.length, output.length);
+              }
+              
+              // Replacements
+              output = output.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+              output = output.replace(/No changes. No objects need to be destroyed./g, "+ No changes. No objects need to be destroyed.");
+              output = output.replace(/No changes. Infrastructure is up-to-date./g, "+ No changes. Infrastructure is up-to-date.");
+              output = output.replace(/Plan:/g, "+ Plan:");
+              output = output.replace(/Destroy complete!/g, "- Destroy complete!");
+              output = output.replace(/Apply complete!/g, "+ Apply complete!");
+              output = output.replace(/No changes. Your infrastructure matches the configuration./g, "+ No changes. Your infrastructure matches the configuration.");
+              output = output.replace(/No changes. Your infrastructure still matches the configuration./g, "+ No changes. Your infrastructure still matches the configuration.");
+              output = output.replace(/Refreshing state... /g, "");
+              output = output.replace(/Error:/g, "- Error:");
+              output = output.replace(/\  \-/g, "-");
+              output = output.replace(/\  \+/g, "+");
+              output = output.replace(/\  \~/g, "!");
+              output = output.replace(/----/g, "====");
+              
+              // Save the processed file
+              fs.writeFile('/tmp/tgplan.txt', output, 'utf8', (err) => {
+                if (err) {
+                  console.error(err);
+                  return;
+                }
+                console.log('File updated successfully');
+              });
+
+              // Function to split text into chunks
+              function splitIntoChunks(text, maxLength) {
+                const chunks = [];
+                let currentChunk = '';
+                const lines = text.split('\n');
+                
+                for (const line of lines) {
+                  if ((currentChunk + line + '\n').length > maxLength) {
+                    if (currentChunk) {
+                      chunks.push(currentChunk);
+                      currentChunk = '';
+                    }
+                    // Si una línea individual es demasiado larga, dividirla
+                    if (line.length > maxLength) {
+                      for (let i = 0; i < line.length; i += maxLength) {
+                        chunks.push(line.slice(i, i + maxLength));
+                      }
+                    } else {
+                      currentChunk = line + '\n';
+                    }
+                  } else {
+                    currentChunk += line + '\n';
+                  }
+                }
+                if (currentChunk) {
+                  chunks.push(currentChunk);
+                }
+                return chunks;
+              }
+
+              // Prepare output with markdown format
+              const formattedOutput = "```diff\n" + output + "\n```";
+              const chunks = splitIntoChunks(formattedOutput, 60000); // Usar un límite un poco menor para el margen de seguridad
+
+              // Post the first comment with the heading
+              let firstComment = "### :clipboard: Terraform Plan: \n\n <details><summary>Show Plan output (Part 1/" + chunks.length + ")</summary> \n\n" + chunks[0] + '\n\n</details>';
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: firstComment
+              });
+
+              // Post the rest of the chunks as additional comments if they exist.
+              for (let i = 1; i < chunks.length; i++) {
+                let comment = "### Terraform Plan (Continued - Part " + (i+1) + "/" + chunks.length + ")\n\n<details><summary>Show Plan output</summary> \n\n" + chunks[i] + '\n\n</details>';
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+              }
+            });
+
+      - name: Save Terragrunt Plan output
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: tgplan-${{ steps.planid.outputs.planid }}
+          path: /tmp/tgplan.txt
+  # Avoid get-modified-files 
+  terragrunt-destroy:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    environment:
+      name: terragruntDestroy
+    steps:
+      - name: Get GH Token
+        id: get_gh_token
+        uses: peter-murray/workflow-application-token-action@v4
+        with:
+          application_id: ${{ vars.GH_APP_ID }}
+          application_private_key: ${{ secrets.GH_APP_KEY }}
+          organization: Merlin-Data-Quality
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.get_gh_token.outputs.token }}
+
+      - name: Configure Git for All Module Types
+        run: |
+          echo "🔧 Configuring Git for public and private modules..."
+          echo "machine github.com login x password ${GH_APP_KEY}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git config --global advice.detachedHead false
+          git config --global credential.helper store
+          echo "https://x:${GH_APP_KEY}@github.com" > ~/.git-credentials
+          echo "✅ Git configured for both public and private repositories"
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+
+      - name: Determine AWS Role for Environment
+        id: get_aws_role
+        env:
+          ASSUME_ROL_DEV: ${{ secrets.ASSUME_ROL_DEV }}
+          ASSUME_ROL_QA: ${{ secrets.ASSUME_ROL_QA }}
+          ASSUME_ROL_PROD: ${{ secrets.ASSUME_ROL_PROD }}
+          ASSUME_ROL_AFT: ${{ secrets.ASSUME_ROL_AFT }}
+          ASSUME_ROL_MARKET: ${{ secrets.ASSUME_ROL_MARKET }}
+          ASSUME_ROL_NETWORKING: ${{ secrets.ASSUME_ROL_NETWORKING }}
+          ASSUME_ROL_SHARED: ${{ secrets.ASSUME_ROL_SHARED }}
+          ASSUME_ROL_AUDIT: ${{ secrets.ASSUME_ROL_AUDIT }}
+          ASSUME_ROL_SHARED_SERVICES: ${{ secrets.ASSUME_ROL_SHARED_SERVICES }}
+          ASSUME_ROL_MERLIN_ORGANIZATION: ${{ secrets.ASSUME_ROL_MERLIN_ORGANIZATION }}
+          ASSUME_ROL_MARKETPLACE: ${{ secrets.ASSUME_ROL_MARKETPLACE }}
+        run: |
+          destroy_dir="${{ github.event.inputs.destroy_directory }}"
+          env_name=$(echo "$destroy_dir" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+          
+          # Map environment names to secret variable names
+          case "$env_name" in
+            "dev") secret_var_name="ASSUME_ROL_DEV" ;;
+            "qa") secret_var_name="ASSUME_ROL_QA" ;;
+            "prod") secret_var_name="ASSUME_ROL_PROD" ;;
+            "aft") secret_var_name="ASSUME_ROL_AFT" ;;
+            "market") secret_var_name="ASSUME_ROL_MARKET" ;;
+            "networking") secret_var_name="ASSUME_ROL_NETWORKING" ;;
+            "shared") secret_var_name="ASSUME_ROL_SHARED" ;;
+            "audit") secret_var_name="ASSUME_ROL_AUDIT" ;;
+            "sharedservices") secret_var_name="ASSUME_ROL_SHARED_SERVICES" ;;
+            "merlin_organization") secret_var_name="ASSUME_ROL_MERLIN_ORGANIZATION" ;;
+            "marketplace") secret_var_name="ASSUME_ROL_MARKETPLACE" ;;
+            *) 
+              echo "::error::Unknown environment: $env_name"
+              exit 1
+              ;;
+          esac
+          
+          # Get the role ARN from environment variables
+          role_arn="${!secret_var_name}"
+          if [ -z "$role_arn" ]; then
+            echo "::error::No role found for environment: $env_name (variable: $secret_var_name)"
+            exit 1
+          fi
+          
+          echo "Environment: $env_name"
+          echo "Role ARN: $role_arn"
+          echo "SELECTED_ROL=$role_arn" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.get_aws_role.outputs.SELECTED_ROL }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: destroysession
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.tf_version }}
+
+      - name: Setup Terragrunt
+        run: |
+          sudo wget -q -O /bin/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.tg_version }}/terragrunt_linux_amd64"
+          sudo chmod +x /bin/terragrunt
+          terragrunt -v
+
+      - name: Terragrunt destroy
+        working-directory: ./${{ github.event.inputs.destroy_directory }}
+        run: |
+          echo "🔥 Starting destroy of: ${{ github.event.inputs.destroy_directory }}"
+          terragrunt destroy -auto-approve 
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+          TF_VAR_backend_role_arn: "${{ secrets.ASSUME_ROL_BACKEND }}"
+
+      - name: Remove infrastructure code from repository
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          echo "🗑️ Removing code: ${{ github.event.inputs.destroy_directory }}"
+          git rm -r ${{ github.event.inputs.destroy_directory }}
+          git commit -m "chore: Remove infrastructure code for ${{ github.event.inputs.destroy_directory }}"
+          git push
+          echo "✅ Code removed from repository"
+
+  terragrunt-apply:
+    needs: [check-skip-condition, get-modified-files, terragrunt-plan]
+    runs-on: ${{ vars.RUNNER_TYPE }}
+    # Only for PRs and if workflow should not be skipped
+    if: github.event_name == 'pull_request' && needs.check-skip-condition.outputs.should_skip != 'true'
+    environment:
+      name: Terragrunt Plan
+    strategy:
+      matrix:
+        PROJECT_DIRECTORY: ${{ fromJSON(needs.get-modified-files.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ./${{ matrix.PROJECT_DIRECTORY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Get GH Token
+        id: get_gh_token
+        uses: peter-murray/workflow-application-token-action@v4
+        with:
+          application_id: ${{ vars.GH_APP_ID }}
+          application_private_key: ${{ secrets.GH_APP_KEY }}
+          organization: Merlin-Data-Quality
+
+      - name: Configure Git for All Module Types
+        run: |
+          echo "🔧 Configuring Git for public and private modules..."
+          
+          # Configurar .netrc para acceso HTTPS
+          echo "machine github.com login x password ${GH_APP_KEY}" > ~/.netrc
+          chmod 600 ~/.netrc
+          
+          # Configurar git globals
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git config --global advice.detachedHead false
+          
+          # Configurar credential helper para Terragrunt
+          git config --global credential.helper store
+          echo "https://x:${GH_APP_KEY}@github.com" > ~/.git-credentials
+          
+          echo "✅ Git configured for both public and private repositories"
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+
+      - name: Extract substring from matrix.PROJECT_DIRECTORY
+        id: extract_substring
+        run: |
+          # Extract the substring after the second "/"
+          substring=${{ matrix.PROJECT_DIRECTORY }}
+          substring=$(echo $substring | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+          echo "substring=$substring" >> $GITHUB_OUTPUT
+
+      - name: Extract substring from matrix.PROJECT_DIRECTORY
+        id: planid
+        run: |
+          # Remove slashes from the string
+          planid=$(echo "${{ matrix.PROJECT_DIRECTORY }}" | sed 's/\///g')
+          planid=$(echo $planid | tr '[:upper:]' '[:lower:]')
+          echo "planid=$planid" >> $GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.tf_version }}
+      
+      - name: Setup Terragrunt
+        run: |
+          sudo wget -q -O /bin/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.tg_version }}/terragrunt_linux_amd64"
+          sudo chmod +x /bin/terragrunt
+          terragrunt -v
+
+      - name: Recover Terraform Plan output
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: tgplan-${{ steps.planid.outputs.planid }}
+          path: /tmp
+
+
+      - name: Create approval issue
+        id: create_issue
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_gh_token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            
+            try {
+              const output = fs.readFileSync('/tmp/tgplan.txt', 'utf8');
+              // Extract only the Plan line, not the full summary
+              const planSummaryMatch = output.match(/Plan:[^\n]*/);
+              const planSummary = planSummaryMatch ? planSummaryMatch[0] : 'No plan summary available';
+              
+              const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+              const prUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/pull/${context.issue.number}`;
+              
+              // Create a concise message for the issue body
+              let message = [
+                '### 📋 Terraform Plan Summary',
+                '',
+                planSummary,
+                '',
+                `🔍 [View complete plan](${prUrl})`,
+                `⚙️ [View workflow run](${runUrl})`,
+                '',
+                'Please review the planned changes and respond with "approve" or "deny".',
+                '',
+                '---',
+                '**Instructions:**',
+                '- Review the Terraform plan above',
+                '- Comment "approve" to proceed with apply',
+                '- Comment "deny" to skip the apply',
+                '',
+                '**Approvers:** @Fer-at-Crubyt, @dhbarrios-crubyt, @fabianaguilarcrubyt, @figlesias-merlin, @mgalarza-merlin, @francovargas-jpg'
+              ].join('\n');
+
+              // Ensure message doesn't exceed GitHub's limit
+              const maxLength = 65000; // Leave some margin
+              if (message.length > maxLength) {
+                message = [
+                  '### 📋 Terraform Plan Summary',
+                  '',
+                  'Plan output is too large to display here.',
+                  '',
+                  `🔍 [View complete plan](${prUrl})`,
+                  `⚙️ [View workflow run](${runUrl})`,
+                  '',
+                  'Please review the planned changes and respond with "approve" or "deny".',
+                  '',
+                  '---',
+                  '**Instructions:**',
+                  '- Review the Terraform plan in the PR comments',
+                  '- Comment "approve" to proceed with apply',
+                  '- Comment "deny" to skip the apply',
+                  '',
+                  '**Approvers:** @Fer-at-Crubyt, @dhbarrios-crubyt, @fabianaguilarcrubyt, @figlesias-merlin, @mgalarza-merlin, @francovargas-jpg'
+                ].join('\n');
+              }
+
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚀 Terraform Apply Approval Required - ${{ matrix.PROJECT_DIRECTORY }}`,
+                body: message,
+                labels: ['terraform', 'approval-required']
+              });
+              
+              core.setOutput('issue_number', issue.data.number);
+              console.log(`Created approval issue #${issue.data.number}`);
+              return issue.data.number;
+            } catch (error) {
+              core.setFailed(`Error creating approval issue: ${error.message}`);
+            }
+
+      - name: Wait for approval
+        id: approval
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_gh_token.outputs.token }}
+          script: |
+            const issueNumber = ${{ steps.create_issue.outputs.issue_number }};
+            const approvers = ['Fer-at-Crubyt', 'dhbarrios-crubyt', 'fabianaguilarcrubyt', 'figlesias-merlin', 'mgalarza-merlin', 'francovargas-jpg'];
+            const maxWaitTime = 10 * 60 * 1000; // 10 minutes
+            const pollInterval = 30 * 1000; // 30 seconds
+            
+            const startTime = Date.now();
+            
+            while (Date.now() - startTime < maxWaitTime) {
+              // Get all comments on the issue
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              // Check for approval/denial from authorized users
+              for (const comment of comments.data) {
+                const username = comment.user.login;
+                const body = comment.body.toLowerCase().trim();
+                
+                if (approvers.includes(username)) {
+                  if (body === 'approve') {
+                    // Close the issue and mark as approved
+                    await github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issueNumber,
+                      state: 'closed',
+                      labels: ['terraform', 'approved']
+                    });
+                    
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issueNumber,
+                      body: `✅ **APPROVED** by @${username}\n\nProceeding with Terraform apply...`
+                    });
+                    
+                    core.setOutput('approved', 'true');
+                    console.log(`Approved by ${username}`);
+                    return true;
+                  } else if (body === 'deny') {
+                    // Close the issue and mark as denied
+                    await github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issueNumber,
+                      state: 'closed',
+                      labels: ['terraform', 'denied']
+                    });
+                    
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issueNumber,
+                      body: `❌ **DENIED** by @${username}\n\nTerraform apply will be skipped.`
+                    });
+                    
+                    core.setOutput('approved', 'false');
+                    console.log(`Denied by ${username}`);
+                    return false;
+                  }
+                }
+              }
+              
+              // Wait before checking again
+              await new Promise(resolve => setTimeout(resolve, pollInterval));
+            }
+            
+            // Timeout - close issue and deny
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed',
+              labels: ['terraform', 'timeout']
+            });
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `⏰ **TIMEOUT** - No response received within 10 minutes\n\nTerraform apply will be skipped.`
+            });
+            
+            core.setOutput('approved', 'false');
+            console.log('Timeout - approval denied');
+            return false;
+
+      - name: Check approval result
+        id: check_approval
+        run: |
+          if [ "${{ steps.approval.outputs.approved }}" = "true" ]; then
+            echo "approved=true" >> $GITHUB_OUTPUT
+            echo "✅ Apply approved for ${{ matrix.PROJECT_DIRECTORY }}"
+          else
+            echo "approved=false" >> $GITHUB_OUTPUT
+            echo "❌ Apply denied/skipped for ${{ matrix.PROJECT_DIRECTORY }}"
+          fi
+
+      - name: Download rol value
+        if: steps.check_approval.outputs.approved == 'true'
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: roles
+
+      - name: Set workspace path
+        if: steps.check_approval.outputs.approved == 'true'
+        id: workspace
+        run: |
+          if [[ "${{ vars.RUNNER_TYPE }}" == "ubuntu-latest" ]]; then
+            echo "path=/home/runner/work/iac/iac" >> $GITHUB_OUTPUT
+          else
+            echo "path=/home/ubuntu/actions-runner/_work/iac/iac" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Obtain the role
+        if: steps.check_approval.outputs.approved == 'true'
+        id: awsrol
+        shell: bash
+        run: |
+          cd ${{ steps.workspace.outputs.path }}
+          export value=$(cat rol-${{ steps.extract_substring.outputs.substring }}.txt)
+          echo "SELECTED_ROL=${value}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        if: steps.check_approval.outputs.approved == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.awsrol.outputs.SELECTED_ROL }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: samplerolesession
+
+      - name: Terragrunt apply
+        if: steps.check_approval.outputs.approved == 'true'
+        run: |
+          terragrunt apply -auto-approve | tee -a /tmp/tgapply.txt 
+        env:
+          GH_APP_KEY: ${{ steps.get_gh_token.outputs.token }}
+          TF_VAR_backend_role_arn: "${{ secrets.ASSUME_ROL_BACKEND }}"
+
+      - name: Skip apply notification
+        if: steps.check_approval.outputs.approved == 'false'
+        run: |
+          echo "🚫 Apply skipped for ${{ matrix.PROJECT_DIRECTORY }} - not approved"
+
+      - name: Add comment to PR (Apply Skipped)
+        if: steps.check_approval.outputs.approved == 'false'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_gh_token.outputs.token }}
+          script: |
+            const comment = `### 🚫 Terraform Apply Skipped
+            
+            **Directory:** \`${{ matrix.PROJECT_DIRECTORY }}\`
+            **Reason:** Apply was denied or not approved
+            **Status:** ✅ Workflow completed successfully (no changes applied)
+            
+            The infrastructure changes for this directory were not applied as requested.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Add comment to PR (Terraform Apply Result)
+        if: steps.check_approval.outputs.approved == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.get_gh_token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            fs.readFile('/tmp/tgplan.txt', 'utf8', async (err, output) => {
+              if (err) {
+                console.error(err);
+                return;
+              }
+              
+              // Maintain existing output processing
+              refreshSeparator = "------------------------------------------------------------------------\n"
+              idx = output.indexOf(refreshSeparator);
+              if (idx > -1) {
+                  output = output.substring(idx + refreshSeparator.length, output.length);
+              }
+              
+              // Replacements
+              output = output.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+              output = output.replace(/No changes. No objects need to be destroyed./g, "+ No changes. No objects need to be destroyed.");
+              output = output.replace(/No changes. Infrastructure is up-to-date./g, "+ No changes. Infrastructure is up-to-date.");
+              output = output.replace(/Plan:/g, "+ Plan:");
+              output = output.replace(/Destroy complete!/g, "- Destroy complete!");
+              output = output.replace(/Apply complete!/g, "+ Apply complete!");
+              output = output.replace(/No changes. Your infrastructure matches the configuration./g, "+ No changes. Your infrastructure matches the configuration.");
+              output = output.replace(/No changes. Your infrastructure still matches the configuration./g, "+ No changes. Your infrastructure still matches the configuration.");
+              output = output.replace(/Refreshing state... /g, "");
+              output = output.replace(/Error:/g, "- Error:");
+              output = output.replace(/\  \-/g, "-");
+              output = output.replace(/\  \+/g, "+");
+              output = output.replace(/\  \~/g, "!");
+              output = output.replace(/----/g, "====");
+              
+              // Save the processed file
+              fs.writeFile('/tmp/tgplan.txt', output, 'utf8', (err) => {
+                if (err) {
+                  console.error(err);
+                  return;
+                }
+                console.log('File updated successfully');
+              });
+
+              // Function to split text into chunks
+              function splitIntoChunks(text, maxLength) {
+                const chunks = [];
+                let currentChunk = '';
+                const lines = text.split('\n');
+                
+                for (const line of lines) {
+                  if ((currentChunk + line + '\n').length > maxLength) {
+                    if (currentChunk) {
+                      chunks.push(currentChunk);
+                      currentChunk = '';
+                    }
+                    // Si una línea individual es demasiado larga, dividirla
+                    if (line.length > maxLength) {
+                      for (let i = 0; i < line.length; i += maxLength) {
+                        chunks.push(line.slice(i, i + maxLength));
+                      }
+                    } else {
+                      currentChunk = line + '\n';
+                    }
+                  } else {
+                    currentChunk += line + '\n';
+                  }
+                }
+                if (currentChunk) {
+                  chunks.push(currentChunk);
+                }
+                return chunks;
+              }
+
+              // Prepare output in markdown format
+              const formattedOutput = "```diff\n" + output + "\n```";
+              const chunks = splitIntoChunks(formattedOutput, 60000); // Usar un límite un poco menor para el margen de seguridad
+
+              // Publish first comment with header
+              let firstComment = "### :clipboard: Terraform Plan: \n\n <details><summary>Show Plan output (Part 1/" + chunks.length + ")</summary> \n\n" + chunks[0] + '\n\n</details>';
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: firstComment
+              });
+
+              // Publish the rest of the chunks as additional comments if they exist
+              for (let i = 1; i < chunks.length; i++) {
+                let comment = "### Terraform Plan (Continued - Part " + (i+1) + "/" + chunks.length + ")\n\n<details><summary>Show Plan output</summary> \n\n" + chunks[i] + '\n\n</details>';
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+              }
+            });

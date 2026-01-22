@@ -1,0 +1,19 @@
+name: Nivel 1 - Saludo Personalizado
+
+# Disparador: Manual (Aparecerá un botón en GitHub)
+on:
+  workflow_dispatch:
+    inputs:
+      nombre_usuario:
+        description: 'Escribe tu nombre'
+        required: true
+        default: 'Estudiante UTN'
+
+jobs:
+  saludar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Paso de Bienvenida
+        run: |
+          echo "Hola, ${{ github.event.inputs.nombre_usuario }}!"
+          echo "Este es tu primer flujo de automatización corriendo en un servidor de GitHub."
